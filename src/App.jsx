@@ -231,6 +231,10 @@ const CONTROLS = [
   { id: "V-07", d: "vault-auth", t: "Login MFA", resp: "customer", sev: "high",
     desc: "Require MFA for logins or sensitive operations.",
     why: "A stolen password or token alone should not be enough to reach secrets.",
+    externalStatus: {
+      label: "External MFA used",
+      note: "MFA is enforced at the identity provider (for example Microsoft Entra) on the SSO login path rather than by native Vault MFA. Recorded as a compensating control: a second factor is still required before a Vault token is issued, so V-07 counts as fully aligned and earns full maturity credit. Confirm the IdP conditional-access policy actually enforces MFA for the groups that log in to Vault.",
+    },
     criteria: [
       "An MFA method is configured",
       "Login MFA enforcement is bound to auth mounts or groups",
@@ -875,6 +879,445 @@ const CONTROLS = [
     ] },
 ];
 
+/* Per-criterion rationale glosses, surfaced in the collapsible Rationale
+   panel on each control card. Keyed by control id; where a variant control
+   carries different criteria per deployment, keyed by `id:deployment` and
+   resolved in that order (id:dep first, then bare id). Each array is aligned
+   by index to the control's resolved `criteria` array — same order, same
+   length. Criteria arrays themselves are left untouched, so scoring, the
+   checks-by-index model and the save format are unaffected. */
+const GLOSS = {
+  "V-01": [
+    "No listener should serve plaintext HTTP; even one exposes tokens and secrets on the wire.",
+    "Each listener must present a real, trusted certificate, not a self-signed placeholder clients can't verify.",
+    "Rules out downgrade to TLS 1.0/1.1 and weak cipher suites a network attacker could exploit.",
+    "8201 carries unseal and replication traffic and must be encrypted too, not just the 8200 API.",
+    "Certificates need a managed lifecycle and renewal so expiry or compromise is handled, not left to manual re-issue.",
+  ],
+  "V-02": [
+    "Confirms Vault is actually on integrated storage, not an external backend with its own failure modes.",
+    "An odd voter count across AZs preserves quorum through a node or zone loss without split-brain.",
+    "Verifies every expected voter is present and healthy, so the configured redundancy really exists.",
+    "Keeps the internal replication port off general networks; only peer nodes should reach it.",
+  ],
+  "V-03:hcp": [
+    "Confirms audit events are leaving the cluster, not just being generated — the baseline for any forensic trail.",
+    "Logs kept only on the cluster vanish with it; central storage survives compromise and enables correlation.",
+    "A silent streaming failure is a blind spot; alerting makes a broken pipeline visible quickly.",
+  ],
+  "V-03:enterprise": [
+    "Self-managed Vault ships with auditing off; this confirms at least one device is actually recording requests.",
+    "If the only audit device blocks, Vault stops serving; a second device avoids that single point of failure.",
+    "Keeps local logs from filling the disk and gets a durable copy off the host for retention and search.",
+    "A hung file or socket device can halt all Vault operations; health monitoring catches it before an outage.",
+  ],
+  "V-04": [
+    "Moves master-key protection to a managed HSM-backed service and removes fragile manual unseal.",
+    "A key used only for Vault's seal keeps its blast radius and access policy narrow.",
+    "Least privilege on the unseal identity stops it being reused to reach other cloud resources.",
+    "With auto-unseal, recovery keys — not unseal keys — gate privileged ops; confirm they exist and are split among custodians.",
+  ],
+  "V-05:hcp": [
+    "Routine use of the all-powerful admin token means a leak or mistake has unlimited reach.",
+    "Gives administrators enough rights for normal work without handing them the god-mode token.",
+    "Rotation bounds how long a leaked token stays valid.",
+    "Defines who may use the admin token, when, and with what approval and logging, so emergencies aren't a free-for-all.",
+    "Tokens in pipelines or repos leak widely and persist in history; the most privileged token must never live there.",
+  ],
+  "V-05:enterprise": [
+    "The root token bypasses every policy; it should be revoked once setup is done, not kept around.",
+    "Administrators work under least-privilege policies rather than regenerating root.",
+    "Root should be minted on demand for a specific emergency and destroyed straight after, never left live.",
+    "Audit logs should show root going quiet after bootstrap; ongoing root use is a red flag.",
+  ],
+  "V-06": [
+    "Confirms people log in through the IdP rather than with static, long-lived Vault tokens.",
+    "Access follows IdP group membership, so joiners and leavers are handled centrally.",
+    "Stops a large, loosely-governed IdP group from silently granting admin in Vault.",
+    "The OIDC redirect/callback URLs must list only your real Vault endpoints (UI, CLI, allowed hosts) and the discovery URL must point at your own tenant. Loose or wildcard redirects let an attacker capture the auth response and hijack a login.",
+  ],
+  "V-07": [
+    "Checks a real MFA method (TOTP, Duo, Okta, PingID, etc.) is set up in Vault, not just planned. If MFA is enforced at your IdP instead, mark the control \"External MFA used\".",
+    "A configured method only helps once it's actually enforced on the login paths or groups that matter.",
+    "Admin and sensitive paths are the highest-value targets and should always sit behind a second factor.",
+    "A locked-out admin needs a safe, documented recovery path so MFA doesn't cause its own outage.",
+  ],
+  "V-08": [
+    "Default TTLs are rarely right; tuning them stops tokens living far longer than the work needs.",
+    "Lease lifetimes on secrets engines should match your policy, not inherit generous defaults.",
+    "A system-wide max caps anything that slips through per-mount tuning.",
+    "Periodic tokens never expire on their own; limit them and let Vault Agent handle renewal instead.",
+  ],
+  "V-09": [
+    "Narrow path grants are what keep one team or app out of another's secrets.",
+    "A wildcard like secret/* with full capabilities is effectively near-root over everything beneath it.",
+    "sudo unlocks protected endpoints; it belongs only in deliberate admin policies.",
+    "Knowing which roles attach each policy is how you spot accidental over-grants.",
+  ],
+  "V-10": [
+    "Group-based access scales; per-identity grants rot as people move.",
+    "Attaching policy to a group updates everyone's access when membership changes.",
+    "Aliasing ties Vault groups to IdP groups so access follows the directory automatically.",
+    "Drift between Vault and the IdP is where stale access hides; periodic review catches it.",
+  ],
+  "V-11": [
+    "v2 adds versioning and soft-delete that v1 can't offer.",
+    "Leftover v1 mounts have no recovery if a secret is overwritten or deleted.",
+    "Check-and-set forces a version check on write, blocking one process clobbering another's update.",
+  ],
+  "V-12": [
+    "Confirms short-lived, generated credentials are actually in use, not just available.",
+    "A dynamic credential is only as safe as the permissions its role grants in the target system.",
+    "Dynamic creds should expire in line with your overall TTL policy (V-08), not linger.",
+    "The benefit only lands once the old standing credentials are actually retired.",
+  ],
+  "V-13": [
+    "Bounding retained versions stops old, possibly compromised values staying recoverable forever.",
+    "Time-boxing version retention limits how long sensitive history sticks around.",
+  ],
+  "V-14": [
+    "A written convention is what makes consistent, enforceable segmentation possible.",
+    "Convention only helps if real paths actually follow it.",
+    "Distinct mounts give hard boundaries between, say, prod and dev.",
+    "Policies that mirror the path layout stay least-privilege instead of sweeping wildcards.",
+  ],
+  "V-15": [
+    "Wrapping turns a bootstrap secret into a single-use token so interception is detectable.",
+    "A stored wrapping token defeats the one-time guarantee.",
+    "An unexpected or failed unwrap is a tamper signal worth watching.",
+  ],
+  "V-16": [
+    "Short lifetimes shrink the window a stolen key is useful.",
+    "Confirms issued certs actually honour the short TTL rather than overriding it.",
+    "Short certs are only practical with automated renewal; manual renewal doesn't scale.",
+  ],
+  "V-17": [
+    "Issuing from an intermediate keeps the root out of day-to-day exposure.",
+    "Isolating the root limits who and what can ever reach it.",
+    "Without the full chain, validation breaks even when the PKI is sound.",
+  ],
+  "V-18": [
+    "A current CRL is how clients learn a cert was revoked before its natural expiry.",
+    "Revocation data only works if the published distribution URLs actually resolve for clients.",
+    "OCSP gives real-time revocation checks without downloading a whole CRL.",
+  ],
+  "V-19": [
+    "The root signs the entire trust chain; access must be a short, named list.",
+    "Isolation keeps routine PKI work away from the root.",
+    "A second factor on the most sensitive CA stops a single stolen credential reaching it.",
+    "A root only reachable during a signing ceremony has almost no attack surface the rest of the time.",
+    "A written ceremony makes rare root operations repeatable, witnessed, and auditable.",
+  ],
+  "V-20": [
+    "Non-exportable keys mean raw key material never leaves Vault — the whole point of encryption-as-a-service.",
+    "An export grant quietly undoes non-exportability.",
+    "If export is truly required, it should be a deliberate, narrow, documented exception.",
+  ],
+  "V-21": [
+    "Rotation limits how much data is bound to any single key version.",
+    "Rewrapping moves old ciphertext onto current keys so you can retire the old ones.",
+    "Advancing min_decryption_version too early makes data under old versions undecryptable.",
+  ],
+  "V-22": [
+    "Derivation isolates tenants cryptographically under one base key.",
+    "The per-tenant context is what keeps one tenant from decrypting another's data.",
+    "Derived keys only work when the same context accompanies every operation.",
+  ],
+  "V-23": [
+    "Named-key grants stop one service operating on another's keys.",
+    "Per-service keys give clean isolation and a smaller blast radius.",
+    "Knowing who uses each key is how you reason about impact if one is compromised.",
+  ],
+  "V-24": [
+    "Confirms pods authenticate by their service-account identity rather than static tokens.",
+    "Wildcards would let any pod assume the role; specific bindings keep it tight.",
+    "These let Vault validate pod tokens with the cluster; misconfiguration breaks or weakens that trust.",
+  ],
+  "V-25": [
+    "That's the minimum the reviewer needs; anything broader is an unnecessary foothold.",
+    "A compromised broadly-bound service account hands over the cluster.",
+    "The official baseline is least-privilege by design; drift from it usually adds risk.",
+  ],
+  "V-26": [
+    "Default-deny means only explicitly allowed pods can reach Vault.",
+    "Scoping ingress limits lateral movement toward Vault.",
+    "NetworkPolicy objects do nothing if the CNI in use doesn't enforce them.",
+  ],
+  "V-27": [
+    "PSA labels are what actually apply the security standard to the namespace.",
+    "Least privilege in the container limits the damage of an escape.",
+    "Enforcement, not just labelling, is what blocks non-compliant pods.",
+  ],
+  "V-28": [
+    "Injection keeps secrets out of plain Kubernetes Secret objects.",
+    "The annotations are what wire a pod to the right Vault role and secret rendering.",
+    "Leftover native Secrets reintroduce the exposure injection was meant to remove.",
+    "Where native Secrets must remain, KMS envelope encryption protects them in etcd.",
+  ],
+  "V-29": [
+    "A single-purpose unseal key keeps its policy and blast radius narrow.",
+    "Only Vault should be able to use the unseal key, and only for those operations.",
+    "Rotating the KMS key limits exposure if the backing key material is ever compromised.",
+    "Use of the unseal key is a high-value signal; it should be logged and watchable.",
+  ],
+  "V-30": [
+    "Lets cloud compute authenticate by its cloud identity instead of a stored Vault token.",
+    "Binding to specific roles/principals stops the whole account authenticating as one workload.",
+    "The benefit only lands once the static tokens are actually removed.",
+  ],
+  "V-31:hcp": [
+    "Private paths keep Vault traffic off the public internet.",
+    "An open public endpoint is an unnecessary attack surface once private access exists.",
+    "Confirms clients actually use the private route rather than falling back to public.",
+  ],
+  "V-31:enterprise": [
+    "Vault servers should never be directly reachable from the internet.",
+    "Vault's own dependencies should also stay on private paths, not egress to public endpoints.",
+    "Confirms the API is consumed privately end to end.",
+  ],
+  "V-32:hcp": [
+    "Only known client ranges should be able to reach Vault.",
+    "An any-source rule exposes Vault to the whole internet.",
+    "Tight client-side rules limit what a compromised client can reach.",
+  ],
+  "V-32:enterprise": [
+    "Open ingress exposes the API and the cluster port to scanning and tampering.",
+    "The API port should accept traffic only from the load balancer or named clients.",
+    "The cluster port is for peer traffic; nothing else should reach it.",
+  ],
+  "V-33": [
+    "IMDSv2's session tokens defeat the SSRF tricks that steal IMDSv1 credentials.",
+    "New instances must inherit IMDSv2 or the gap reappears as the fleet scales.",
+    "Old tooling pinned to IMDSv1 blocks enforcement until it's fixed.",
+  ],
+  "V-34": [
+    "Ties Vault identity or Azure credentials to the Entra lifecycle.",
+    "An over-permissioned app registration is a standing risk in the tenant.",
+    "A wrong tenant in the discovery URL can trust the wrong directory.",
+  ],
+  "V-39:hcp": [
+    "Confirms operational metrics are actually being emitted.",
+    "Metrics only help once something is receiving and displaying them.",
+    "The metrics endpoint can leak operational detail; it shouldn't be open.",
+  ],
+  "V-39:enterprise": [
+    "The telemetry stanza is what turns on metric emission in self-managed Vault.",
+    "Confirms the metrics actually arrive somewhere you watch.",
+    "Keeps the metrics endpoint from being an open information source.",
+  ],
+  "V-40:hcp": [
+    "Central logs survive a host loss and enable cross-system correlation.",
+    "Logs must be kept long enough to satisfy audit and investigation needs.",
+    "A sudden drop in log volume is often the first sign the pipeline broke.",
+  ],
+  "V-40:enterprise": [
+    "Central logs survive a host loss and enable cross-system correlation.",
+    "Logs must be kept long enough to satisfy audit and investigation needs.",
+    "A sudden drop in log volume is often the first sign the pipeline broke.",
+  ],
+  "V-41": [
+    "Unparsed logs can't drive detections; correct parsing is the foundation.",
+    "These are the highest-signal events for catching abuse or compromise.",
+    "Detections are only as timely as the slowest step in log delivery.",
+  ],
+  "V-42": [
+    "A sealed or quorum-lost cluster is an outage; it should page, not be discovered by users.",
+    "A failing audit device can stall Vault and blind your trail at once.",
+    "Expiry is predictable and entirely avoidable with lead-time alerts.",
+    "The right alert to the wrong inbox is a missed alert.",
+  ],
+  "V-43:hcp": [
+    "A snapshot is a full copy of your data; at-rest encryption protects it if the store is exposed.",
+    "Only a narrow backup identity should be able to read these complete copies.",
+    "A restore is useless if you can't unseal the restored data; capture that dependency now.",
+  ],
+  "V-43:enterprise": [
+    "Regular snapshots are the basis of any Vault recovery plan.",
+    "Snapshots are portable full copies; encrypt them at rest.",
+    "Limit who can read the complete dataset a snapshot represents.",
+    "Document what's needed to unseal a restored snapshot, or recovery stalls mid-incident.",
+  ],
+  "V-44:hcp": [
+    "Immutability stops an attacker deleting or tampering with backups before a destructive act.",
+    "Few identities should ever be able to delete a backup.",
+    "Logged access to backups gives early warning of tampering.",
+  ],
+  "V-44:enterprise": [
+    "Object Lock / immutable blobs defend backups against ransomware-style deletion.",
+    "Backup deletion should be a rare, tightly-held privilege.",
+    "Access logs on backups surface tampering attempts.",
+  ],
+  "V-45:hcp": [
+    "A backup you've never restored is an assumption, not a recovery plan.",
+    "Recovery isn't done when Vault is up — apps and logins have to work too.",
+    "A current runbook is what makes recovery repeatable under pressure.",
+    "If your RTO can't tolerate a region loss, you need cross-region DR in place.",
+  ],
+  "V-45:enterprise": [
+    "Only a real restore proves the backups and procedure actually work.",
+    "Unseal is the step most likely to surprise you during a restore; test it explicitly.",
+    "Confirms downstream apps and auth work after recovery, not just the Vault process.",
+    "A current runbook keeps recovery repeatable when it counts.",
+  ],
+  "V-46": [
+    "A quorum means no single person can unseal or rekey alone.",
+    "Separating shares stops one break-in or disaster capturing a quorum.",
+    "Shares held by leavers, or with no succession plan, are a recovery risk.",
+    "Rekeying on personnel change invalidates shares the departed still hold.",
+  ],
+  "V-47": [
+    "A warm secondary is what lets you recover quickly from losing the primary.",
+    "Performance replicas serve local reads and spread load where one cluster can't.",
+    "Unmonitored lag means your secondary may be further behind than you think.",
+    "An untested secondary is a hope, not a DR control; promotion must be rehearsed.",
+  ],
+  "V-48": [
+    "Namespaces give hard multi-tenancy boundaries between teams.",
+    "Delegated admin lets teams self-serve without cluster-wide power.",
+    "Namespace-scoped policies keep one tenant's rules from reaching another's data.",
+    "Cross-namespace wildcards quietly dissolve the isolation namespaces provide.",
+  ],
+  "V-49": [
+    "Seal Wrap adds an extra layer of protection to critical values for FIPS attestations.",
+    "A FIPS-validated seal backend is what the compliance requirement actually turns on.",
+    "Auditors need the posture written down, not just configured.",
+  ],
+  "V-50": [
+    "Dual authorization stops one compromised identity reading the crown jewels alone.",
+    "The approvers themselves must be a tight, named set.",
+    "Requirements drift; periodic review keeps the gate meaningful.",
+  ],
+  "V-51": [
+    "Sentinel expresses conditions — source CIDR, MFA, time — that ACL policies alone can't.",
+    "Governance code belongs in VCS with review, like any other policy.",
+    "An advisory policy that should be hard-mandatory is a guardrail in name only.",
+  ],
+  "T-01": [
+    "SSO centralises identity so access follows the IdP.",
+    "A surviving password path is a bypass around every SSO control.",
+    "Offboarding in the IdP must actually remove Terraform access.",
+  ],
+  "T-02": [
+    "Scoped teams keep blast radius proportional to the role.",
+    "Org owners can do anything; the list must stay short.",
+    "Separating who can plan from who can apply adds a change-control gate.",
+    "Access accretes over time; review trims what's no longer needed.",
+  ],
+  "T-03:hcp": [
+    "Streaming is what gives you a durable, searchable record of admin activity.",
+    "Membership, permission and policy-change events are the ones worth detecting on.",
+    "A broken audit pipeline is a silent blind spot unless monitored.",
+  ],
+  "T-03:enterprise": [
+    "Self-hosted logs that stay on the box vanish with it; forward them off.",
+    "Parsed governance events are what detections run on.",
+    "Gaps in forwarding mean missing evidence; watch for them.",
+  ],
+  "T-04": [
+    "Just-in-time credentials remove standing cloud keys from Terraform.",
+    "Static keys in variables are long-lived secrets that leak via state and logs.",
+    "Each workspace should get only the cloud rights its resources need.",
+  ],
+  "T-05": [
+    "Marking variables sensitive keeps values out of logs and the UI.",
+    "Committed secrets leak widely and persist in history.",
+    "Referencing a secret manager beats storing the secret in Terraform at all.",
+  ],
+  "T-06": [
+    "Managed state is access-controlled and durable; local state for prod is neither.",
+    "State holds sensitive outputs; read/write must be gated by team.",
+    "Blocking local applies forces prod changes through the governed pipeline.",
+  ],
+  "T-07": [
+    "VCS connection is what enforces review and traceability on every change.",
+    "Branch protection stops unreviewed code reaching an apply.",
+    "CLI and local applies bypass review; disabling them closes the side door.",
+    "The VCS link carries your source of truth; it should run over secured, private paths.",
+  ],
+  "T-08": [
+    "A confirmation step is the last gate before a change hits prod.",
+    "Who can apply should be a deliberate, short list.",
+    "Auto-apply removes the human gate; keep it off where review matters.",
+  ],
+  "T-09": [
+    "Drift detection surfaces out-of-band changes before they bite.",
+    "A drift report nobody reads changes nothing.",
+  ],
+  "T-10": [
+    "Attached policy sets are what actually evaluate on runs.",
+    "Advisory-only on a must-have rule is a guardrail you can drive through.",
+    "Encryption, tagging and region/size checks are the common high-value plan guardrails.",
+  ],
+  "T-11": [
+    "Run tasks shift security checks into the run, not just code review.",
+    "A run task sees your plan; an untrusted vendor is a data-exposure risk.",
+    "A finding that doesn't stop the run is just a log line.",
+  ],
+  "T-12": [
+    "A curated registry gives reviewed, consistent building blocks.",
+    "Pinning stops an unreviewed module change landing silently.",
+    "Self-service curated modules steer teams onto the paved road.",
+  ],
+  "T-13": [
+    "Locking versions keeps external code from changing under you.",
+    "Limiting sources shrinks the supply-chain surface.",
+    "Signature checks catch tampered or substituted artifacts.",
+  ],
+  "T-14": [
+    "An over-privileged agent bridges the control plane into your private networks.",
+    "An unpatched agent is a long-lived foothold on your network edge.",
+    "Rotation bounds how long a leaked agent token stays useful.",
+  ],
+  "T-15": [
+    "Unsupported installs don't get fixes and complicate recovery.",
+    "The TFE host is now inside your trust boundary with normal server duties.",
+    "Shell and container access to TFE should be a short operator list.",
+    "Every extra service or port is attack surface you own.",
+  ],
+  "T-16": [
+    "TFE carries credentials, state and run data; plaintext exposes all of it.",
+    "Rules out downgrade and weak ciphers on the TFE endpoint.",
+    "A plaintext hop behind the load balancer still exposes everything on that segment.",
+    "Certs expire; a rotation process avoids an outage or a lapse.",
+  ],
+  "T-17": [
+    "Internal mode isn't meant for production durability or recovery.",
+    "The DB link carries TFE's application data; encrypt it in transit.",
+    "TFE's database user should hold only the rights it needs.",
+    "The database is TFE's system of record; protect and back it up.",
+  ],
+  "T-18": [
+    "External object storage gives the durability and scale state needs.",
+    "State and artifacts here are sensitive; encrypt them at rest.",
+    "A public or over-shared bucket is a direct breach of state.",
+    "Versioning lets you recover from accidental or malicious overwrites.",
+  ],
+  "T-19": [
+    "Self-hosting makes TFE recovery your job; automate the backups.",
+    "A TFE backup is a sensitive full copy; protect it like one.",
+    "An untested backup isn't a recovery plan.",
+    "Recovery targets define what 'recovered' means and shape the design.",
+  ],
+  "T-20": [
+    "This password unseals TFE's internal Vault; losing it can make backups and state unrecoverable.",
+    "The most critical TFE secret must never land in a repo or a build log.",
+    "Operators need to know how the internal Vault unseals before an incident, not during one.",
+    "Define the recovery path now, because discovering there isn't one mid-outage is too late.",
+  ],
+  "T-21": [
+    "Self-hosted TFE only gets security fixes when you upgrade it.",
+    "A cadence keeps you from drifting far behind supported releases.",
+    "You can't act on a fix you never saw.",
+    "Staging validation catches breakage before it hits prod.",
+  ],
+  "T-22": [
+    "The admin console is full control of TFE; lock it to admins and known networks.",
+    "A public TFE is a direct, discoverable path to your runs and state.",
+    "Segmentation stops a compromised workload reaching TFE laterally.",
+    "Admin identity should sit behind SSO and a second factor.",
+  ],
+};
+
 /* ---- deployment resolution -------------------------------------------- */
 function resolve(c, meta) {
   const product = DOMAIN_PRODUCT[c.d];
@@ -882,6 +1325,7 @@ function resolve(c, meta) {
   const v = c.variants && c.variants[dep];
   const merged = v ? { ...c, ...v } : { ...c };
   merged.product = product;
+  merged.dep = dep;
   merged.stage = STAGE_TAGS[c.id] || null;
   delete merged.variants;
   return merged;
@@ -917,7 +1361,9 @@ function alignmentFor(rc, a) {
 /* A control is "met" for the maturity gate only when fully aligned
    (or, for a control with no criteria, when marked in use). */
 function isMet(rc, a) {
-  if ((a.status || "unset") !== "implemented") return false;
+  const st = a.status || "unset";
+  if (st === "external") return true;   // satisfied by an external/compensating control
+  if (st !== "implemented") return false;
   const al = alignmentFor(rc, a);
   return al ? al.level === "full" : true;
 }
@@ -1046,6 +1492,7 @@ export default function App() {
       const st = a.status || "unset";
       if (st === "na") { counts.na++; continue; }
       if (st === "unset") { counts.unset++; continue; }
+      if (st === "external") { counts.full++; num += 1; den += 1; continue; }
       if (st === "not_implemented") {
         if (rc.optional) counts.notImpl++;
         else { counts.missing++; den += 1; }
@@ -1089,12 +1536,23 @@ export default function App() {
         pocs.push({ scope: `${rc.id} · ${rc.t}`, product: rc.product, text: rc.poc });
     }
 
+    // Controls satisfied by an external / compensating control (e.g. V-07
+    // via IdP-enforced MFA). Scored as aligned above; surfaced separately so
+    // the report explains why they are not flagged as gaps.
+    const comps = [];
+    for (const rc of assessable) {
+      const a = assess[rc.id] || {};
+      if ((a.status || "unset") === "external" && rc.externalStatus) {
+        comps.push({ id: rc.id, t: rc.t, product: rc.product, note: rc.externalStatus.note, userNote: a.notes || "" });
+      }
+    }
+
     // Per-product maturity on the Adopt -> Standardize -> Scale curve.
     const maturity = { vault: computeMaturity("vault"), terraform: computeMaturity("terraform") };
 
     const total = assessable.length;
     const done = total - counts.unset;
-    return { assessable, score, counts, findings, pocs, total, done, maturity };
+    return { assessable, score, counts, findings, pocs, comps, total, done, maturity };
 
     // Gated over the already-resolved, deployment-aware assessable set.
     function computeMaturity(product) {
@@ -1128,7 +1586,7 @@ export default function App() {
   const sevCount = (lvl) => derived.findings.filter((f) => f.c.sev === lvl).length;
 
   const exportJSON = () => {
-    const blob = new Blob([JSON.stringify({ meta, assess, caps, v: 3 }, null, 2)],
+    const blob = new Blob([JSON.stringify({ meta, assess, caps, v: 4 }, null, 2)],
       { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1297,6 +1755,46 @@ function CapabilityToggle({ dom, value, onChange }) {
   );
 }
 
+function RationalePanel({ c }) {
+  const [open, setOpen] = useState(false);
+  const gloss = GLOSS[`${c.id}:${c.dep}`] || GLOSS[c.id] || [];
+  const hasCrit = Array.isArray(c.criteria) && c.criteria.length > 0;
+  return (
+    <div style={{ marginTop: 10, marginLeft: 34 }}>
+      <button className="rationale-toggle" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+        <span className="chev" style={{ transform: open ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+        Rationale
+      </button>
+      {open && (
+        <div className="rationale-body">
+          <div style={{ fontSize: 12.8, color: C.muted, lineHeight: 1.55 }}>
+            <strong style={{ color: C.ink }}>Best practice.</strong> {c.desc}
+          </div>
+          <div style={{ fontSize: 12.8, color: C.muted, lineHeight: 1.55, marginTop: 6 }}>
+            <strong style={{ color: C.ink }}>Why we check this.</strong> {c.why}
+          </div>
+          {hasCrit && (
+            <div style={{ marginTop: 11 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase",
+                letterSpacing: 0.5, color: C.faint, marginBottom: 7 }}>
+                What each criterion checks
+              </div>
+              <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 9 }}>
+                {c.criteria.map((crit, i) => (
+                  <li key={i} style={{ fontSize: 12.6, lineHeight: 1.5, borderLeft: `2px solid ${C.accentSoft}`, paddingLeft: 10 }}>
+                    <div style={{ fontWeight: 600, color: C.ink }}>{crit}</div>
+                    {gloss[i] && <div style={{ color: C.muted, marginTop: 2 }}>{gloss[i]}</div>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ControlCard({ c, a, setCtl, toggleCheck, setAllChecks }) {
   const managed = c.resp === "hashicorp";
   const status = a.status || "unset";
@@ -1322,10 +1820,17 @@ function ControlCard({ c, a, setCtl, toggleCheck, setAllChecks }) {
                 </Badge>
               </span>
             )}
+            {status === "external" && (
+              <span style={{ marginLeft: "auto" }}>
+                <Badge fg={ALIGN.full.fg} bg={ALIGN.full.bg} mono>Satisfied · external</Badge>
+              </span>
+            )}
           </div>
           <div style={{ fontSize: 13, color: C.muted, marginTop: 5, lineHeight: 1.5 }}>{c.desc}</div>
         </div>
       </div>
+
+      {c.why && <RationalePanel c={c} />}
 
       {managed ? (
         <div style={{ marginTop: 10, marginLeft: 34, fontSize: 12.5, color: C.faint,
@@ -1336,9 +1841,17 @@ function ControlCard({ c, a, setCtl, toggleCheck, setAllChecks }) {
             onChange={(v) => setCtl(c.id, { status: v === status ? "unset" : v })}
             options={[
               { v: "implemented", label: "In use", fg: "#067647", bg: "#E7F6EC" },
+              ...(c.externalStatus ? [{ v: "external", label: c.externalStatus.label, fg: "#175CD3", bg: "#E0EAFB" }] : []),
               { v: "not_implemented", label: "Not implemented", fg: "#B54708", bg: "#FEF0C7" },
               { v: "na", label: "N/A", fg: C.muted, bg: "#EEF0F3" },
             ]} />
+
+          {status === "external" && c.externalStatus && (
+            <div style={{ fontSize: 12.5, color: "#1849A9", background: "#E8EFFB",
+              border: "1px solid #C7D7F5", borderRadius: 8, padding: "9px 11px", lineHeight: 1.5 }}>
+              <strong style={{ color: "#175CD3" }}>Counts as fully aligned.</strong> {c.externalStatus.note}
+            </div>
+          )}
 
           {status === "implemented" && c.criteria && (
             <div style={{ border: `1px solid ${C.line}`, borderRadius: 8, overflow: "hidden" }}>
@@ -1534,7 +2047,7 @@ function MaturityCard({ product, m, meta }) {
 }
 
 function Report({ meta, derived, sevCount }) {
-  const { findings, pocs, score, maturity } = derived;
+  const { findings, pocs, comps, score, maturity } = derived;
   const managed = CONTROLS
     .filter((c) => controlApplies(c, meta))
     .map((c) => resolve(c, meta))
@@ -1633,6 +2146,34 @@ function Report({ meta, derived, sevCount }) {
             </div>
           )}
 
+          {comps.length > 0 && (
+            <>
+              <SectionTitle style={{ marginTop: 26 }}>Compensating controls</SectionTitle>
+              <div style={{ fontSize: 12.5, color: C.muted, marginTop: 6, marginBottom: 8, lineHeight: 1.55 }}>
+                Accepted as satisfied by a control outside the native product. Scored as aligned and credited toward
+                maturity; recorded here so the acceptance is explicit rather than appearing as a gap.
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {comps.map((cp) => (
+                  <div key={cp.id} style={{ background: "#E8EFFB", border: "1px solid #C7D7F5", borderRadius: 8, padding: "11px 13px" }}>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: 12, fontWeight: 700, color: C.accent }}>{cp.id}</span>
+                      <span style={{ fontWeight: 650, fontSize: 13 }}>{cp.t}</span>
+                      <Badge fg={PROD[cp.product].fg} bg={PROD[cp.product].bg}>{prodLabel(cp.product, meta)}</Badge>
+                      <Badge fg={ALIGN.full.fg} bg={ALIGN.full.bg}>Accepted</Badge>
+                    </div>
+                    <div style={{ fontSize: 12.8, color: "#334155", marginTop: 5, lineHeight: 1.5 }}>{cp.note}</div>
+                    {cp.userNote && (
+                      <div style={{ fontSize: 12.2, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>
+                        <strong style={{ color: C.ink }}>Assessor note.</strong> {cp.userNote}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
           <SectionTitle style={{ marginTop: 26 }}>Proof-of-concept recommendations</SectionTitle>
           {pocs.length === 0 ? (
             <Empty>No capabilities marked not implemented.</Empty>
@@ -1722,6 +2263,11 @@ const CSS = `
   .btn-solid:hover{ background:#3647a8; }
   .link-btn{ background:none; border:none; color:${C.accent}; font-size:11.5px; font-weight:650; cursor:pointer; padding:0; }
   .link-btn:hover{ text-decoration:underline; }
+  .rationale-toggle{ display:inline-flex; align-items:center; gap:6px; background:none; border:none; cursor:pointer;
+    color:${C.accent}; font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; padding:0; }
+  .rationale-toggle:hover{ color:#3647a8; }
+  .rationale-toggle .chev{ display:inline-block; font-size:10px; transition:transform .12s ease; }
+  .rationale-body{ margin-top:9px; background:#FAFBFC; border:1px solid ${C.line}; border-radius:8px; padding:12px 14px; }
   .navitem{ width:100%; display:flex; align-items:center; justify-content:space-between; gap:8px; text-align:left;
     border:1px solid transparent; border-radius:8px; padding:7px 10px; margin:1px 0; cursor:pointer; background:transparent; font-size:13px; }
   .navitem:hover{ background:#fff; }
